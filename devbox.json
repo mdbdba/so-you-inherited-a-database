@@ -1,0 +1,20 @@
+{
+  "packages": [
+    "just@latest",
+    "httpie@3.2.4",
+    "bat@0.26.1",
+    "python@3.14.3",
+    "uv@0.10.4"
+  ],
+  "shell": {
+    "init_hook": [
+      "echo 'So, You Inherited a Database'",
+      "echo 'Just version:' $(just --version)",
+      "echo ''",
+      "echo 'Available commands:'",
+      "echo '  just          - Show available commands'",
+      "echo ''"
+    ],
+    "scripts": {}
+  }
+}
