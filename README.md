@@ -1,5 +1,7 @@
 # so-you-inherited-a-database
 
+> **Work in progress** – this project is under active development and is not ready for production use.
+
 A demo environment and inspection toolkit for Postgres databases you've just inherited.
 
 Bluebox drives external workload against Postgres. This repo provides `dbx` — a CLI that
