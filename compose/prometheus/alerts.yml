@@ -1,0 +1,259 @@
+# PostgreSQL Alerting Rules
+# Based on SRE best practices from service_level_management.md
+
+groups:
+  # Critical operational alerts
+  - name: postgresql_critical
+    interval: 30s
+    rules:
+      # Transaction wraparound prevention (CRITICAL)
+      - alert: TransactionWraparoundDanger
+        expr: pg_transaction_wraparound_xid_age > 1500000000
+        for: 5m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "Database {{ $labels.database }} approaching transaction wraparound"
+          description: "XID age: {{ $value }}, remaining: {{ $labels.xids_remaining }} XIDs. Database will shut down at 2B."
+          runbook: "https://wiki/runbooks/transaction-wraparound"
+
+      # Data corruption detection (CRITICAL)
+      - alert: DataCorruptionDetected
+        expr: increase(pg_transaction_throughput_checksum_failures[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "Data corruption detected in {{ $labels.database }}"
+          description: "Checksum failures indicate disk corruption. Immediate investigation required."
+          runbook: "https://wiki/runbooks/data-corruption"
+
+      # Database unavailable (CRITICAL)
+      - alert: PostgreSQLDown
+        expr: up{job="postgres"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "PostgreSQL is down on {{ $labels.instance }}"
+          description: "postgres_exporter cannot connect to PostgreSQL."
+          runbook: "https://wiki/runbooks/database-down"
+
+  # SLO-based alerts (symptom-based)
+  - name: postgresql_slo
+    interval: 30s
+    rules:
+      # Fast error budget burn (2% in 1 hour)
+      - alert: ErrorBudgetBurnRateFast
+        expr: |
+          (
+            1 - (
+              rate(pg_transaction_throughput_xact_commit[1h])
+              /
+              (rate(pg_transaction_throughput_xact_commit[1h]) + rate(pg_transaction_throughput_xact_rollback[1h]))
+            )
+          ) > 0.014
+        for: 5m
+        labels:
+          severity: critical
+          slo: availability
+          burn_rate: fast
+        annotations:
+          summary: "Fast error budget burn detected"
+          description: "2% of monthly error budget consumed in 1 hour. At this rate, budget exhausted in 50 hours."
+          runbook: "https://wiki/runbooks/error-budget-burn"
+
+      # Slow error budget burn (10% in 6 hours)
+      - alert: ErrorBudgetBurnRateSlow
+        expr: |
+          (
+            1 - (
+              rate(pg_transaction_throughput_xact_commit[6h])
+              /
+              (rate(pg_transaction_throughput_xact_commit[6h]) + rate(pg_transaction_throughput_xact_rollback[6h]))
+            )
+          ) > 0.002
+        for: 30m
+        labels:
+          severity: warning
+          slo: availability
+          burn_rate: slow
+        annotations:
+          summary: "Slow error budget burn detected"
+          description: "10% of monthly error budget consumed in 6 hours. At this rate, budget exhausted in 60 hours."
+          runbook: "https://wiki/runbooks/error-budget-burn"
+
+      # High transaction error rate
+      - alert: HighTransactionErrorRate
+        expr: |
+          rate(pg_transaction_throughput_xact_rollback[5m])
+          /
+          (rate(pg_transaction_throughput_xact_commit[5m]) + rate(pg_transaction_throughput_xact_rollback[5m]))
+          > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          slo: reliability
+        annotations:
+          summary: "High transaction error rate in {{ $labels.database }}"
+          description: "Error rate: {{ $value | humanizePercentage }} (threshold: 1%)"
+          runbook: "https://wiki/runbooks/high-error-rate"
+
+  # Performance and capacity warnings
+  - name: postgresql_performance
+    interval: 30s
+    rules:
+      # Connection pool saturation
+      - alert: HighConnectionUsage
+        expr: pg_connection_utilization_utilization_ratio > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: connection_pool
+        annotations:
+          summary: "Connection pool at {{ $value | humanizePercentage }} capacity"
+          description: "{{ $labels.instance }} using {{ $value | humanizePercentage }} of max connections"
+          runbook: "https://wiki/runbooks/high-connections"
+
+      # Long-running transactions blocking vacuum
+      - alert: LongRunningTransaction
+        expr: pg_oldest_transaction_oldest_xact_seconds > 3600
+        for: 5m
+        labels:
+          severity: warning
+          component: vacuum
+        annotations:
+          summary: "Transaction running for {{ $value | humanizeDuration }}"
+          description: "Long-running transaction preventing vacuum on {{ $labels.instance }}"
+          runbook: "https://wiki/runbooks/long-transaction"
+
+      # Query blocking
+      - alert: QueryBlocking
+        expr: pg_blocking_queries_blocked_count > 0
+        for: 2m
+        labels:
+          severity: warning
+          component: locks
+        annotations:
+          summary: "PID {{ $labels.blocking_pid }} blocking {{ $value }} queries"
+          description: "Lock contention detected on {{ $labels.instance }}"
+          runbook: "https://wiki/runbooks/blocking-queries"
+
+      # Excessive temporary file usage (work_mem tuning needed)
+      - alert: HighTempFileUsage
+        expr: rate(pg_temp_files_temp_bytes[5m]) > 104857600  # 100MB/s
+        for: 5m
+        labels:
+          severity: warning
+          component: performance
+        annotations:
+          summary: "High temp file usage in {{ $labels.database }}: {{ $value | humanize }}B/s"
+          description: "Queries spilling to disk. Consider increasing work_mem."
+          runbook: "https://wiki/runbooks/temp-files"
+
+      # Deadlock detection
+      - alert: DeadlocksDetected
+        expr: increase(pg_transaction_throughput_deadlocks[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: locks
+        annotations:
+          summary: "Deadlocks detected in {{ $labels.database }}"
+          description: "{{ $value }} deadlocks in the last 5 minutes"
+          runbook: "https://wiki/runbooks/deadlocks"
+
+  # Capacity planning alerts
+  - name: postgresql_capacity
+    interval: 5m
+    rules:
+      # Disk space forecast (30 days)
+      - alert: DiskSpaceLow
+        expr: |
+          (
+            predict_linear(pg_database_size_bytes[7d], 30*24*3600)
+            /
+            on() group_left()
+            (pg_database_size_bytes + 100*1024*1024*1024)  # Assume 100GB headroom
+          ) > 0.85
+        for: 1h
+        labels:
+          severity: warning
+          component: capacity
+        annotations:
+          summary: "Disk will be 85% full in 30 days"
+          description: "Database {{ $labels.database }} growth trending toward capacity limits"
+          runbook: "https://wiki/runbooks/disk-capacity"
+
+      # Connection pool trending toward saturation
+      - alert: ConnectionPoolTrending
+        expr: |
+          predict_linear(pg_connection_utilization_current_connections[24h], 7*24*3600)
+          >
+          pg_connection_utilization_max_connections * 0.9
+        for: 1h
+        labels:
+          severity: info
+          component: capacity
+        annotations:
+          summary: "Connection pool will saturate in 7 days"
+          description: "Current trend suggests connection pool exhaustion within a week"
+          runbook: "https://wiki/runbooks/connection-capacity"
+
+      # Cache hit ratio degradation
+      - alert: LowCacheHitRatio
+        expr: pg_cache_hit_ratio_cache_hit_ratio < 0.95
+        for: 10m
+        labels:
+          severity: warning
+          component: performance
+        annotations:
+          summary: "Cache hit ratio below 95% in {{ $labels.database }}"
+          description: "Hit ratio: {{ $value | humanizePercentage }}. Consider increasing shared_buffers."
+          runbook: "https://wiki/runbooks/cache-tuning"
+
+  # Operational health checks
+  - name: postgresql_health
+    interval: 1m
+    rules:
+      # Vacuum not running (dead tuple accumulation)
+      - alert: VacuumNotRunning
+        expr: pg_table_maintenance_seconds_since_last_autovacuum > 86400
+        for: 1h
+        labels:
+          severity: warning
+          component: maintenance
+        annotations:
+          summary: "Table {{ $labels.tablename }} not vacuumed in 24+ hours"
+          description: "Dead tuples accumulating in {{ $labels.schemaname }}.{{ $labels.tablename }}"
+          runbook: "https://wiki/runbooks/vacuum-issues"
+
+      # Invalid indexes detected
+      - alert: InvalidIndexDetected
+        expr: pg_invalid_indexes_is_invalid > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: maintenance
+        annotations:
+          summary: "Invalid index {{ $labels.indexname }} on {{ $labels.tablename }}"
+          description: "Index build likely failed. Should be rebuilt."
+          runbook: "https://wiki/runbooks/invalid-index"
+
+      # Sequential scans on large tables
+      - alert: MissingIndexesSuspected
+        expr: |
+          pg_sequential_scans_seq_scan > 1000
+          and
+          pg_sequential_scans_table_size_bytes > 10485760  # 10MB
+        for: 10m
+        labels:
+          severity: info
+          component: performance
+        annotations:
+          summary: "High sequential scans on {{ $labels.tablename }}"
+          description: "{{ $value }} seq scans on large table. Consider adding index."
+          runbook: "https://wiki/runbooks/missing-indexes"

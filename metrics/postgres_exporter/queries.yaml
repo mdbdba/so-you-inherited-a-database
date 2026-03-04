@@ -1,0 +1,499 @@
+# Custom queries for postgres_exporter
+# This file demonstrates how to add custom metrics to the exporter
+# Reference: https://github.com/prometheus-community/postgres_exporter
+
+# Example 1: Database size metrics
+pg_database_size:
+  query: "SELECT datname as database, pg_database_size(datname) as size_bytes FROM pg_database WHERE datistemplate = false"
+  master: true
+  metrics:
+    - database:
+        usage: "LABEL"
+        description: "Database name"
+    - size_bytes:
+        usage: "GAUGE"
+        description: "Size of the database in bytes"
+
+# Example 2: Table bloat estimation
+pg_table_bloat:
+  query: |
+    SELECT
+      schemaname,
+      tablename,
+      pg_total_relation_size((quote_ident(schemaname)||'.'||quote_ident(tablename))::regclass) AS total_bytes,
+      pg_relation_size((quote_ident(schemaname)||'.'||quote_ident(tablename))::regclass) AS table_bytes,
+      pg_total_relation_size((quote_ident(schemaname)||'.'||quote_ident(tablename))::regclass) -
+        pg_relation_size((quote_ident(schemaname)||'.'||quote_ident(tablename))::regclass) AS index_bytes
+    FROM pg_tables
+    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+  master: true
+  metrics:
+    - schemaname:
+        usage: "LABEL"
+        description: "Schema name"
+    - tablename:
+        usage: "LABEL"
+        description: "Table name"
+    - total_bytes:
+        usage: "GAUGE"
+        description: "Total size of table including indexes"
+    - table_bytes:
+        usage: "GAUGE"
+        description: "Size of table data"
+    - index_bytes:
+        usage: "GAUGE"
+        description: "Size of indexes"
+
+# Example 3: Connection state counts
+pg_connection_states:
+  query: |
+    SELECT
+      state,
+      COUNT(*) as count
+    FROM pg_stat_activity
+    WHERE state IS NOT NULL
+    GROUP BY state
+  master: true
+  metrics:
+    - state:
+        usage: "LABEL"
+        description: "Connection state"
+    - count:
+        usage: "GAUGE"
+        description: "Number of connections in this state"
+
+# Example 4: Long running queries
+pg_long_running_queries:
+  query: |
+    SELECT
+      COUNT(*) as count
+    FROM pg_stat_activity
+    WHERE state = 'active'
+      AND now() - query_start > interval '5 minutes'
+  master: true
+  metrics:
+    - count:
+        usage: "GAUGE"
+        description: "Number of queries running longer than 5 minutes"
+
+# Example 5: Cache hit ratio
+# Note: Replication lag is provided by the built-in --collector.replication
+# as pg_replication_lag_seconds, so no custom query is needed
+pg_cache_hit_ratio:
+  query: |
+    SELECT
+      datname as database,
+      CASE
+        WHEN (blks_hit + blks_read) = 0 THEN 0
+        ELSE (blks_hit::float / (blks_hit + blks_read)::float)
+      END as cache_hit_ratio
+    FROM pg_stat_database
+    WHERE datname NOT IN ('template0', 'template1')
+  master: true
+  metrics:
+    - database:
+        usage: "LABEL"
+        description: "Database name"
+    - cache_hit_ratio:
+        usage: "GAUGE"
+        description: "Cache hit ratio (0-1)"
+
+# Example 6: Index usage statistics
+pg_index_usage:
+  query: |
+    SELECT
+      schemaname,
+      relname as tablename,
+      indexrelname as indexname,
+      idx_scan as index_scans,
+      idx_tup_read as tuples_read,
+      idx_tup_fetch as tuples_fetched
+    FROM pg_stat_user_indexes
+    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+  master: true
+  metrics:
+    - schemaname:
+        usage: "LABEL"
+        description: "Schema name"
+    - tablename:
+        usage: "LABEL"
+        description: "Table name"
+    - indexname:
+        usage: "LABEL"
+        description: "Index name"
+    - index_scans:
+        usage: "COUNTER"
+        description: "Number of index scans"
+    - tuples_read:
+        usage: "COUNTER"
+        description: "Number of tuples read from index"
+    - tuples_fetched:
+        usage: "COUNTER"
+        description: "Number of tuples fetched from table"
+
+# Example 7: Vacuum and analyze statistics
+pg_table_maintenance:
+  query: |
+    SELECT
+      schemaname,
+      relname as tablename,
+      COALESCE(EXTRACT(EPOCH FROM (now() - last_vacuum)), -1) as seconds_since_last_vacuum,
+      COALESCE(EXTRACT(EPOCH FROM (now() - last_autovacuum)), -1) as seconds_since_last_autovacuum,
+      COALESCE(EXTRACT(EPOCH FROM (now() - last_analyze)), -1) as seconds_since_last_analyze,
+      COALESCE(EXTRACT(EPOCH FROM (now() - last_autoanalyze)), -1) as seconds_since_last_autoanalyze,
+      n_dead_tup as dead_tuples,
+      n_live_tup as live_tuples
+    FROM pg_stat_user_tables
+  master: true
+  metrics:
+    - schemaname:
+        usage: "LABEL"
+        description: "Schema name"
+    - tablename:
+        usage: "LABEL"
+        description: "Table name"
+    - seconds_since_last_vacuum:
+        usage: "GAUGE"
+        description: "Seconds since last manual vacuum (-1 if never)"
+    - seconds_since_last_autovacuum:
+        usage: "GAUGE"
+        description: "Seconds since last autovacuum (-1 if never)"
+    - seconds_since_last_analyze:
+        usage: "GAUGE"
+        description: "Seconds since last manual analyze (-1 if never)"
+    - seconds_since_last_autoanalyze:
+        usage: "GAUGE"
+        description: "Seconds since last autoanalyze (-1 if never)"
+    - dead_tuples:
+        usage: "GAUGE"
+        description: "Number of dead tuples"
+    - live_tuples:
+        usage: "GAUGE"
+        description: "Number of live tuples"
+
+# Example 8: Transaction wraparound risk
+# Critical for preventing database shutdown due to transaction ID wraparound
+pg_transaction_wraparound:
+  query: |
+    SELECT
+      datname as database,
+      age(datfrozenxid) as xid_age,
+      2147483648 - age(datfrozenxid) as xids_remaining
+    FROM pg_database
+    WHERE datallowconn
+  master: true
+  metrics:
+    - database:
+        usage: "LABEL"
+        description: "Database name"
+    - xid_age:
+        usage: "GAUGE"
+        description: "Age of oldest transaction ID"
+    - xids_remaining:
+        usage: "GAUGE"
+        description: "Transaction IDs remaining until wraparound"
+
+# Example 9: Connection pool utilization
+# Monitor connection usage to prevent pool exhaustion
+pg_connection_utilization:
+  query: |
+    SELECT
+      (SELECT COUNT(*) FROM pg_stat_activity) as current_connections,
+      (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_connections,
+      (SELECT COUNT(*) FROM pg_stat_activity)::float /
+        (SELECT setting::int FROM pg_settings WHERE name = 'max_connections')::float as utilization_ratio
+  master: true
+  metrics:
+    - current_connections:
+        usage: "GAUGE"
+        description: "Current number of connections"
+    - max_connections:
+        usage: "GAUGE"
+        description: "Maximum allowed connections"
+    - utilization_ratio:
+        usage: "GAUGE"
+        description: "Connection pool utilization (0-1)"
+
+# Example 10: Blocking queries and lock contention
+# Identify queries that are blocking other queries
+pg_blocking_queries:
+  query: |
+    SELECT
+      blocking.pid::text as blocking_pid,
+      blocked.pid::text as blocked_pid,
+      COUNT(*) as blocked_count
+    FROM pg_locks blocked
+    JOIN pg_stat_activity blocked_activity ON blocked.pid = blocked_activity.pid
+    JOIN pg_locks blocking ON blocking.locktype = blocked.locktype
+      AND blocking.database IS NOT DISTINCT FROM blocked.database
+      AND blocking.relation IS NOT DISTINCT FROM blocked.relation
+      AND blocking.page IS NOT DISTINCT FROM blocked.page
+      AND blocking.tuple IS NOT DISTINCT FROM blocked.tuple
+      AND blocking.virtualxid IS NOT DISTINCT FROM blocked.virtualxid
+      AND blocking.transactionid IS NOT DISTINCT FROM blocked.transactionid
+      AND blocking.classid IS NOT DISTINCT FROM blocked.classid
+      AND blocking.objid IS NOT DISTINCT FROM blocked.objid
+      AND blocking.objsubid IS NOT DISTINCT FROM blocked.objsubid
+      AND blocking.pid != blocked.pid
+    WHERE NOT blocked.granted
+      AND blocking.granted
+    GROUP BY blocking.pid, blocked.pid
+  master: true
+  metrics:
+    - blocking_pid:
+        usage: "LABEL"
+        description: "PID of the blocking query"
+    - blocked_pid:
+        usage: "LABEL"
+        description: "PID of the blocked query"
+    - blocked_count:
+        usage: "GAUGE"
+        description: "Number of queries blocked"
+
+# Example 11: Sequential scans on large tables
+# Identify potentially missing indexes
+pg_sequential_scans:
+  query: |
+    SELECT
+      schemaname,
+      relname as tablename,
+      seq_scan,
+      seq_tup_read,
+      idx_scan,
+      pg_relation_size(relid) as table_size_bytes
+    FROM pg_stat_user_tables
+    WHERE seq_scan > 0
+      AND pg_relation_size(relid) > 10485760
+  master: true
+  metrics:
+    - schemaname:
+        usage: "LABEL"
+        description: "Schema name"
+    - tablename:
+        usage: "LABEL"
+        description: "Table name"
+    - seq_scan:
+        usage: "COUNTER"
+        description: "Number of sequential scans"
+    - seq_tup_read:
+        usage: "COUNTER"
+        description: "Tuples read by sequential scans"
+    - idx_scan:
+        usage: "COUNTER"
+        description: "Number of index scans"
+    - table_size_bytes:
+        usage: "GAUGE"
+        description: "Table size in bytes"
+
+# Example 12: Temporary file usage
+# High temp file usage indicates work_mem may be too small
+pg_temp_files:
+  query: |
+    SELECT
+      datname as database,
+      temp_files,
+      temp_bytes
+    FROM pg_stat_database
+    WHERE datname NOT IN ('template0', 'template1')
+  master: true
+  metrics:
+    - database:
+        usage: "LABEL"
+        description: "Database name"
+    - temp_files:
+        usage: "COUNTER"
+        description: "Number of temporary files created"
+    - temp_bytes:
+        usage: "COUNTER"
+        description: "Total bytes written to temporary files"
+
+# Example 13: WAL generation statistics
+# Monitor WAL generation rate for backup sizing and replication
+pg_wal_stats:
+  query: |
+    SELECT
+      wal_records,
+      wal_fpi,
+      wal_bytes
+    FROM pg_stat_wal
+  master: true
+  metrics:
+    - wal_records:
+        usage: "COUNTER"
+        description: "Total number of WAL records generated"
+    - wal_fpi:
+        usage: "COUNTER"
+        description: "Full page images written"
+    - wal_bytes:
+        usage: "COUNTER"
+        description: "Total bytes of WAL generated"
+
+# Example 14: Table activity (DML operations)
+# Track insert/update/delete rates per table
+pg_table_activity:
+  query: |
+    SELECT
+      schemaname,
+      relname as tablename,
+      n_tup_ins as inserts,
+      n_tup_upd as updates,
+      n_tup_del as deletes,
+      n_tup_hot_upd as hot_updates
+    FROM pg_stat_user_tables
+  master: true
+  metrics:
+    - schemaname:
+        usage: "LABEL"
+        description: "Schema name"
+    - tablename:
+        usage: "LABEL"
+        description: "Table name"
+    - inserts:
+        usage: "COUNTER"
+        description: "Number of rows inserted"
+    - updates:
+        usage: "COUNTER"
+        description: "Number of rows updated"
+    - deletes:
+        usage: "COUNTER"
+        description: "Number of rows deleted"
+    - hot_updates:
+        usage: "COUNTER"
+        description: "Number of HOT updates (no index update needed)"
+
+# Example 15: Invalid indexes
+# Detect indexes that failed to build or are otherwise invalid
+pg_invalid_indexes:
+  query: |
+    SELECT
+      schemaname,
+      tablename,
+      indexname,
+      CASE WHEN indisvalid THEN 0 ELSE 1 END as is_invalid
+    FROM pg_indexes
+    JOIN pg_class ON pg_indexes.indexname = pg_class.relname
+    JOIN pg_index ON pg_class.oid = pg_index.indexrelid
+    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+      AND NOT indisvalid
+  master: true
+  metrics:
+    - schemaname:
+        usage: "LABEL"
+        description: "Schema name"
+    - tablename:
+        usage: "LABEL"
+        description: "Table name"
+    - indexname:
+        usage: "LABEL"
+        description: "Index name"
+    - is_invalid:
+        usage: "GAUGE"
+        description: "1 if index is invalid, 0 if valid"
+
+# Example 16: Oldest open transaction
+# Long-running transactions prevent vacuum from cleaning up dead tuples
+pg_oldest_transaction:
+  query: |
+    SELECT
+      COALESCE(MAX(EXTRACT(EPOCH FROM (now() - xact_start))), 0) as oldest_xact_seconds
+    FROM pg_stat_activity
+    WHERE state IN ('active', 'idle in transaction')
+      AND xact_start IS NOT NULL
+  master: true
+  metrics:
+    - oldest_xact_seconds:
+        usage: "GAUGE"
+        description: "Age of oldest open transaction in seconds"
+
+# Example 17: Query latency tracking (SLI)
+# Requires pg_stat_statements extension
+# Tracks query performance for SLO monitoring
+pg_query_latency:
+  query: |
+    SELECT
+      d.datname as database,
+      s.queryid::text as queryid,
+      LEFT(s.query, 100) as query_sample,
+      s.calls,
+      s.mean_exec_time,
+      s.min_exec_time,
+      s.max_exec_time,
+      s.stddev_exec_time
+    FROM pg_stat_statements s
+    JOIN pg_database d ON s.dbid = d.oid
+    WHERE s.calls > 10
+      AND s.queryid IS NOT NULL
+      AND d.datname = current_database()
+    ORDER BY s.calls DESC
+    LIMIT 100
+  master: true
+  metrics:
+    - database:
+        usage: "LABEL"
+        description: "Database name"
+    - queryid:
+        usage: "LABEL"
+        description: "Query ID from pg_stat_statements"
+    - query_sample:
+        usage: "LABEL"
+        description: "First 100 chars of query"
+    - calls:
+        usage: "COUNTER"
+        description: "Number of times executed"
+    - mean_exec_time:
+        usage: "GAUGE"
+        description: "Mean execution time in milliseconds"
+    - min_exec_time:
+        usage: "GAUGE"
+        description: "Minimum execution time in milliseconds"
+    - max_exec_time:
+        usage: "GAUGE"
+        description: "Maximum execution time in milliseconds"
+    - stddev_exec_time:
+        usage: "GAUGE"
+        description: "Standard deviation of execution time"
+
+# Example 18: Transaction throughput and error rates (SLI)
+# Critical for availability and reliability SLOs
+pg_transaction_throughput:
+  query: |
+    SELECT
+      datname as database,
+      xact_commit,
+      xact_rollback,
+      CASE
+        WHEN (xact_commit + xact_rollback) = 0 THEN 0
+        ELSE (xact_rollback::float / (xact_commit + xact_rollback)::float)
+      END as rollback_ratio,
+      deadlocks,
+      checksum_failures,
+      blk_read_time,
+      blk_write_time
+    FROM pg_stat_database
+    WHERE datname NOT IN ('template0', 'template1')
+  master: true
+  metrics:
+    - database:
+        usage: "LABEL"
+        description: "Database name"
+    - xact_commit:
+        usage: "COUNTER"
+        description: "Transactions committed"
+    - xact_rollback:
+        usage: "COUNTER"
+        description: "Transactions rolled back"
+    - rollback_ratio:
+        usage: "GAUGE"
+        description: "Ratio of rollbacks to total transactions"
+    - deadlocks:
+        usage: "COUNTER"
+        description: "Number of deadlocks detected"
+    - checksum_failures:
+        usage: "COUNTER"
+        description: "Data corruption events"
+    - blk_read_time:
+        usage: "COUNTER"
+        description: "Time spent reading blocks (ms)"
+    - blk_write_time:
+        usage: "COUNTER"
+        description: "Time spent writing blocks (ms)"

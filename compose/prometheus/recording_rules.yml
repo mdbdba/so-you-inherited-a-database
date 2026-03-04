@@ -1,0 +1,119 @@
+# Recording Rules for SLI Calculations
+# Pre-compute expensive queries for dashboards and alerts
+
+groups:
+  # SLI: Availability (success rate)
+  - name: sli_availability
+    interval: 30s
+    rules:
+      # Transaction success rate (5m window)
+      - record: sli:postgres_availability:ratio_rate5m
+        expr: |
+          rate(pg_transaction_throughput_xact_commit[5m])
+          /
+          (rate(pg_transaction_throughput_xact_commit[5m]) + rate(pg_transaction_throughput_xact_rollback[5m]))
+
+      # Transaction success rate (1h window for burn rate)
+      - record: sli:postgres_availability:ratio_rate1h
+        expr: |
+          rate(pg_transaction_throughput_xact_commit[1h])
+          /
+          (rate(pg_transaction_throughput_xact_commit[1h]) + rate(pg_transaction_throughput_xact_rollback[1h]))
+
+      # Transaction success rate (6h window for slow burn)
+      - record: sli:postgres_availability:ratio_rate6h
+        expr: |
+          rate(pg_transaction_throughput_xact_commit[6h])
+          /
+          (rate(pg_transaction_throughput_xact_commit[6h]) + rate(pg_transaction_throughput_xact_rollback[6h]))
+
+      # 30-day rolling availability
+      - record: sli:postgres_availability:ratio_rate30d
+        expr: |
+          avg_over_time(
+            sli:postgres_availability:ratio_rate5m[30d]
+          )
+
+  # SLI: Latency (query execution time)
+  - name: sli_latency
+    interval: 30s
+    rules:
+      # Average query latency (5m window)
+      - record: sli:postgres_latency:mean_seconds_rate5m
+        expr: |
+          avg(pg_query_latency_mean_exec_time) / 1000
+
+      # Maximum query latency (5m window)
+      - record: sli:postgres_latency:max_seconds_rate5m
+        expr: |
+          max(pg_query_latency_max_exec_time) / 1000
+
+  # SLI: Traffic (throughput)
+  - name: sli_traffic
+    interval: 30s
+    rules:
+      # Transactions per second (5m rate)
+      - record: sli:postgres_traffic:transactions_per_second
+        expr: |
+          rate(pg_transaction_throughput_xact_commit[5m])
+
+      # Total operations (commits + rollbacks)
+      - record: sli:postgres_traffic:operations_per_second
+        expr: |
+          rate(pg_transaction_throughput_xact_commit[5m]) + rate(pg_transaction_throughput_xact_rollback[5m])
+
+  # SLI: Saturation (resource utilization)
+  - name: sli_saturation
+    interval: 30s
+    rules:
+      # Connection pool saturation
+      - record: sli:postgres_saturation:connection_utilization_ratio
+        expr: |
+          pg_connection_utilization_utilization_ratio
+
+      # Cache efficiency
+      - record: sli:postgres_saturation:cache_hit_ratio
+        expr: |
+          avg(pg_cache_hit_ratio_cache_hit_ratio)
+
+  # Error budget calculations
+  - name: error_budget
+    interval: 5m
+    rules:
+      # Error budget remaining (99.9% SLO over 30 days)
+      - record: error_budget:postgres:remaining_ratio
+        expr: |
+          (
+            1 - (
+              (1 - sli:postgres_availability:ratio_rate30d)
+              /
+              (1 - 0.999)  # 99.9% SLO
+            )
+          )
+
+      # Days of error budget remaining at current burn rate
+      - record: error_budget:postgres:days_remaining
+        expr: |
+          (error_budget:postgres:remaining_ratio * 30)
+          /
+          (1 - sli:postgres_availability:ratio_rate5m)
+          * (30 / 43200)  # Convert to days
+
+  # Capacity forecasting
+  - name: capacity_forecast
+    interval: 5m
+    rules:
+      # Database size forecast (30 days)
+      - record: capacity:postgres_database:size_bytes_forecast_30d
+        expr: |
+          predict_linear(pg_database_size_bytes[7d], 30*24*3600)
+
+      # Connection count forecast (7 days)
+      - record: capacity:postgres_connections:count_forecast_7d
+        expr: |
+          predict_linear(pg_connection_utilization_current_connections[24h], 7*24*3600)
+
+      # WAL generation rate (bytes per second)
+      - record: capacity:postgres_wal:bytes_per_second
+        expr: |
+          rate(pg_wal_stats_wal_bytes[5m])

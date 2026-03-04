@@ -1,0 +1,59 @@
+# Prometheus configuration for postgres_exporter
+# Includes SRE-focused alerting and recording rules
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s  # Evaluate rules every 30 seconds
+  external_labels:
+    monitor: 'postgres-monitor'
+    cluster: 'dev-cluster'
+
+# Alerting configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'alertmanager:9093'
+
+# Load alerting and recording rules
+rule_files:
+  - 'alerts.yml'
+  - 'recording_rules.yml'
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          component: 'prometheus'
+
+  # PostgreSQL exporter
+  # Scrape more frequently than global default for database SLI/SLO monitoring
+  # Enables sub-minute latency tracking per SRE best practices
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres_exporter:9187']
+        labels:
+          instance: 'postgres-main'
+          environment: 'dev'
+          component: 'database'
+    scrape_interval: 10s  # 10s for real-time SLI tracking (vs 15s global default)
+    scrape_timeout: 5s
+    # Optionally add metric relabeling for cleaner metrics
+    # metric_relabel_configs:
+    #   - source_labels: [__name__]
+    #     regex: 'go_.*'
+    #     action: drop  # Drop Go runtime metrics if not needed
+
+  # Vector observability pipeline monitoring
+  # Critical: Vector is a single point of failure for log collection
+  - job_name: 'vector'
+    static_configs:
+      - targets: ['vector:8686']
+        labels:
+          component: 'monitoring'
+          environment: 'dev'
+    scrape_interval: 15s
+    scrape_timeout: 5s

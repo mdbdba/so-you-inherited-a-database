@@ -1,0 +1,259 @@
+# Vector Configuration
+# Modern observability data pipeline for log collection
+# Collects logs from all Docker containers and sends to Loki
+
+# Data directory for Vector's internal state
+data_dir: /var/lib/vector
+
+# Source: Collect logs from all Docker containers
+sources:
+  docker_logs:
+    type: docker_logs
+
+# Transforms: Process and enrich log data
+transforms:
+  # Parse and structure the logs
+  parse_logs:
+    type: remap
+    inputs:
+      - docker_logs
+    source: |
+      # Extract container name without the leading slash and ensure it's a string
+      .container_name = to_string!(.container_name)
+      .container_name = replace(.container_name, "/", "")  # replace() is infallible, no ! needed
+
+      # Add useful labels for Loki
+      .labels.container = .container_name
+      .labels.image = to_string(.image) ?? "unknown"
+      .labels.stream = to_string(.stream) ?? "unknown"
+
+      # Try to parse JSON logs from applications
+      # Preserve original message, store parsed structure separately
+      if is_string(.message) {
+        parsed, err = parse_json(.message)
+        if err == null {
+          .json = parsed
+          # Keep original message as-is for exact log preservation
+        }
+      }
+
+      # Ensure message is a string
+      .message = to_string!(.message)
+
+  # Extract log level from message
+  extract_level:
+    type: remap
+    inputs:
+      - parse_logs
+    source: |
+      msg = to_string(.message) ?? ""
+      level = "info"  # default to info instead of unknown
+
+      # Check for error levels first (highest priority)
+      if contains(downcase(msg), "error") || contains(downcase(msg), "fatal") || contains(downcase(msg), "panic") {
+        level = "error"
+      } else if contains(downcase(msg), "warn") {
+        level = "warn"
+      } else if contains(downcase(msg), "debug") || contains(downcase(msg), "trace") {
+        level = "debug"
+      }
+
+      .labels.level = level
+
+  # Add monitoring-specific labels
+  add_labels:
+    type: remap
+    inputs:
+      - extract_level
+    source: |
+      # Add namespace label for multi-tenant scenarios
+      .labels.namespace = "pgs_obs_demo"
+
+      # Ensure container_name is a string for pattern matching
+      container = to_string(.container_name) ?? "unknown"
+
+      # Add component type based on container name patterns
+      # More flexible matching - works regardless of docker-compose project name
+      if contains(container, "postgres") && !contains(container, "exporter") {
+        .labels.component = "database"
+        .labels.job = "postgres"
+      } else if contains(container, "exporter") || contains(container, "postgres_exporter") {
+        .labels.component = "monitoring"
+        .labels.job = "postgres_exporter"
+      } else if contains(container, "prometheus") && !contains(container, "exporter") {
+        .labels.component = "monitoring"
+        .labels.job = "prometheus"
+      } else if contains(container, "alertmanager") {
+        .labels.component = "monitoring"
+        .labels.job = "alertmanager"
+      } else if contains(container, "grafana") {
+        .labels.component = "visualization"
+        .labels.job = "grafana"
+      } else if contains(container, "loki") {
+        .labels.component = "monitoring"
+        .labels.job = "loki"
+      } else if contains(container, "vector") {
+        .labels.component = "monitoring"
+        .labels.job = "vector"
+      } else {
+        .labels.component = "other"
+        .labels.job = "unknown"
+      }
+
+  # Route Grafana log lines that need special handling:
+  #   router_logs  — HTTP request lines from GF_SERVER_ROUTER_LOGGING, dropped from Loki
+  #   query_logs   — Loki datasource query records, sent to query-telemetry PostgreSQL DB
+  #   _unmatched   — everything else, flows to Loki as normal
+  route_grafana_logs:
+    type: route
+    inputs:
+      - add_labels
+    route:
+      router_logs: >-
+        .labels.job == "grafana" &&
+        contains(string!(.message), "logger=context") &&
+        contains(string!(.message), "Request Completed")
+      query_logs: >-
+        .labels.job == "grafana" &&
+        contains(string!(.message), "endpoint=queryData") &&
+        contains(string!(.message), "stage=databaseRequest")
+
+  # Parse logfmt fields from Grafana's tsdb.loki queryData lines into structured
+  # columns that map directly to the grafana_query_audit table.
+  parse_query_logs:
+    type: remap
+    inputs:
+      - route_grafana_logs.query_logs
+    source: |
+      parsed = parse_logfmt!(.message)
+
+      # Capture Vector's event timestamp before replacing the event
+      ts = .timestamp
+
+      # String fields — string() is fallible so ?? "" handles absent logfmt keys
+      uname                 = string(parsed.uname)                ?? ""
+      query_text            = string(parsed.query)                ?? ""
+      query_type            = string(parsed.queryType)            ?? ""
+      direction             = string(parsed.direction)            ?? ""
+      ds_name               = string(parsed.dsName)               ?? ""
+      ds_uid                = string(parsed.dsUID)                ?? ""
+      loki_host             = string(parsed.lokiHost)             ?? ""
+      loki_path             = string(parsed.lokiPath)             ?? ""
+      step                  = string(parsed.step)                 ?? ""
+      supporting_query_type = string(parsed.supportingQueryType)  ?? ""
+      status                = string(parsed.status)               ?? ""
+
+      # Boolean field
+      from_alert = (string(parsed.fromAlert) ?? "false") == "true"
+
+      # Integer fields
+      status_code = to_int(string(parsed.statusCode) ?? "0") ?? 0
+      max_lines   = to_int(string(parsed.maxLines)   ?? "0") ?? 0
+
+      # Duration: parse "16.422607ms", "210.374µs", or "1.5s" → float milliseconds
+      duration_raw = string(parsed.duration) ?? "0ms"
+      duration_ms = if ends_with(duration_raw, "µs") {
+          (to_float(replace(duration_raw, "µs", "")) ?? 0.0) / 1000.0
+        } else if ends_with(duration_raw, "ms") {
+          to_float(replace(duration_raw, "ms", "")) ?? 0.0
+        } else if ends_with(duration_raw, "s") {
+          (to_float(replace(duration_raw, "s", "")) ?? 0.0) * 1000.0
+        } else {
+          0.0
+        }
+
+      # Nullable timestamps for query time range
+      start_str = string(parsed.start) ?? ""
+      end_str   = string(parsed.end)   ?? ""
+      query_start = if start_str != "" { parse_timestamp(start_str, "%+") ?? null } else { null }
+      query_end   = if end_str   != "" { parse_timestamp(end_str,   "%+") ?? null } else { null }
+
+      # Replace the event with only the fields that map to table columns
+      . = {
+        "ts":                    ts,
+        "uname":                 uname,
+        "query_text":            query_text,
+        "query_type":            query_type,
+        "direction":             direction,
+        "duration_ms":           duration_ms,
+        "status_code":           status_code,
+        "max_lines":             max_lines,
+        "query_start":           query_start,
+        "query_end":             query_end,
+        "step":                  step,
+        "ds_name":               ds_name,
+        "ds_uid":                ds_uid,
+        "from_alert":            from_alert,
+        "loki_host":             loki_host,
+        "loki_path":             loki_path,
+        "supporting_query_type": supporting_query_type,
+        "status":                status
+      }
+
+# Sinks: Send logs to Loki
+sinks:
+  # Primary sink: Send to Loki
+  # Uses _unmatched so router_logs and query_logs never reach Loki
+  loki:
+    type: loki
+    inputs:
+      - route_grafana_logs._unmatched
+    endpoint: http://loki:3100
+    encoding:
+      codec: json
+    labels:
+      component: "{{ labels.component }}"
+      job: "{{ labels.job }}"
+      namespace: "{{ labels.namespace }}"
+      level: "{{ labels.level }}"
+    remove_label_fields: true
+    batch:
+      max_bytes: 1048576  # 1MB
+      timeout_secs: 1
+    buffer:
+      type: memory
+      max_events: 5000
+    healthcheck:
+      enabled: true
+    request:
+      concurrency: 10
+      rate_limit_duration_secs: 1
+      rate_limit_num: 10
+      retry_attempts: 5
+      retry_initial_backoff_secs: 1
+      retry_max_duration_secs: 10
+      timeout_secs: 60
+
+  # Grafana HTTP router logs: drop entirely, never send to Loki
+  drop_router_logs:
+    type: blackhole
+    inputs:
+      - route_grafana_logs.router_logs
+
+  # Grafana query audit records: write structured rows to query-telemetry DB
+  # All datasource queries (Loki, Mimir, etc) go to common.grafana_query_audit
+  query_telemetry_pg:
+    type: postgres
+    inputs:
+      - parse_query_logs
+    endpoint: "postgresql://vector:${VECTOR_PG_PASSWORD:-vector_password}@postgres:5432/query-telemetry"
+    table: common.grafana_query_audit
+
+  # Optional: Console output for debugging
+  # Uncomment to see logs in Vector's stdout
+  console:
+    type: console
+    inputs:
+      - route_grafana_logs._unmatched
+    encoding:
+      codec: json
+    target: stdout
+
+# API configuration for Vector's internal metrics and health
+api:
+  enabled: true
+  address: 0.0.0.0:8686
+  playground: true
+
+# Internal metrics
+# Vector exposes its own metrics at :8686/metrics in Prometheus format

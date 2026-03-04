@@ -1,0 +1,209 @@
+services:
+  postgres:
+    image: ghcr.io/ryanbooz/bluebox-postgres:${PG_VERSION:-18}
+    container_name: pod_postgres_${PG_VERSION:-18}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      VECTOR_PG_PASSWORD: ${VECTOR_PG_PASSWORD:-vector_password}
+    shm_size: 1gb
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements,auto_explain,pg_cron"
+      - "-c"
+      - "cron.database_name=postgres"
+      - "-c"
+      - "shared_buffers=2GB"
+      - "-c"
+      - "effective_cache_size=6GB"
+      - "-c"
+      - "maintenance_work_mem=1GB"
+      - "-c"
+      - "work_mem=8MB"
+      - "-c"
+      - "max_parallel_workers_per_gather=2"
+      - "-c"
+      - "auto_explain.log_min_duration=500ms"
+      - "-c"
+      - "auto_explain.log_analyze=on"
+      - "-c"
+      - "auto_explain.log_verbose=on"
+      - "-c"
+      - "auto_explain.log_buffers=on"
+      - "-c"
+      - "auto_explain.log_timing=on"
+      - "-c"
+      - "auto_explain.log_triggers=on"
+      - "-c"
+      - "auto_explain.log_nested_statements=on"
+      - "-c"
+      - "auto_explain.log_format=json"
+      - "-c"
+      - "pg_stat_statements.max=5000"
+      - "-c"
+      - "pg_stat_statements.track=all"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./compose/postgres/init/50-monitoring-setup.sh:/docker-entrypoint-initdb.d/50-monitoring-setup.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -U postgres -d bluebox"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15m
+    networks:
+      - monitoring
+
+  postgres_exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: pod_exporter
+    environment:
+      DATA_SOURCE_NAME: ${DATA_SOURCE_NAME:-postgresql://postgres_exporter:exporter_password@postgres:5432/bluebox?sslmode=disable&application_name=postgres_exporter}
+    command:
+      - "--no-collector.wal"
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: pod_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./compose/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./compose/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./compose/prometheus/recording_rules.yml:/etc/prometheus/recording_rules.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d" # 30-day retention for SLO analysis
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle" # Enable reload via API
+    depends_on:
+      - postgres_exporter
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: pod_alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./compose/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--web.external-url=http://localhost:9093"
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: pod_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      GF_SERVER_ROUTER_LOGGING: "true"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./compose/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - loki-healthcheck
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.6.3
+    container_name: pod_loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./compose/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  loki-healthcheck:
+    image: alpine:3.19
+    container_name: pod_loki_healthcheck
+    entrypoint:
+      - sh
+      - -c
+      - |
+        apk add --no-cache curl
+        echo "[$(date)] Starting Loki health monitor..."
+        while true; do
+          echo "[$(date)] Checking Loki health..."
+          if curl -sf http://loki:3100/ready > /dev/null 2>&1; then
+            echo "[$(date)] ✓ Loki is healthy"
+            touch /tmp/healthy
+          else
+            echo "[$(date)] ✗ Loki is unhealthy"
+            rm -f /tmp/healthy
+          fi
+          sleep 10
+        done
+    depends_on:
+      - loki
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/healthy"]
+      start_period: 30s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  vector:
+    image: timberio/vector:0.51.1-alpine
+    container_name: pod_vector
+    environment:
+      VECTOR_PG_PASSWORD: ${VECTOR_PG_PASSWORD:-vector_password}
+    ports:
+      - "8686:8686"
+    volumes:
+      - ./compose/vector/vector.yaml:/etc/vector/vector.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - vector_data:/var/lib/vector
+    command: --config /etc/vector/vector.yaml
+    depends_on:
+      loki-healthcheck:
+        condition: service_healthy
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    name: bluebox-pgdata-${PG_VERSION:-18}
+  prometheus_data:
+  grafana_data:
+  alertmanager_data:
+  loki_data:
+  vector_data:
+
+networks:
+  monitoring:
+    driver: bridge
