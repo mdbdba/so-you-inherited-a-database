@@ -37,8 +37,10 @@ def run_report(
     # Lazy imports – keep CLI startup fast.
     from dbx.grafana.sections import build_telemetry_section
     from dbx.pg.client import PgClient
+    from dbx.pg.extension_health import check_all_extensions
     from dbx.pg.inspect import detect_capabilities
     from dbx.pg.sections import (
+        build_backup_section,
         build_capabilities,
         build_config_summary,
         build_cron_jobs,
@@ -106,17 +108,22 @@ def run_report(
         # ------------------------------------------------------------------
         progress.update(task, description="Capabilities…")
         try:
-            caps_md, caps_data = build_capabilities(caps)
+            try:
+                ext_health = check_all_extensions(pg, caps)
+            except Exception:  # noqa: BLE001
+                ext_health = []
+            caps_md, caps_data = build_capabilities(caps, ext_health=ext_health)
             raw_data["capabilities"] = caps_data
         except Exception as exc:  # noqa: BLE001
             caps_md = f"> **Error building capabilities section:** {exc}"
             raw_data["capabilities"] = {}
         builder.add("Capabilities", caps_md)
 
-        # pg_cron jobs (appended within capabilities)
-        if caps.pg_cron_ready:
+        # pg_cron jobs — shown when ready locally OR when the scheduler lives in
+        # another database (the common pg_cron cross-database pattern).
+        if caps.pg_cron_ready or caps.pg_cron_runs_elsewhere:
             try:
-                cron_md, cron_data = build_cron_jobs(pg, caps)
+                cron_md, cron_data = build_cron_jobs(pg, caps, pg_dsn=settings.pg_dsn)
                 if cron_md:
                     builder.add("pg_cron Jobs", cron_md)
             except Exception:  # noqa: BLE001
@@ -127,7 +134,7 @@ def run_report(
         # ------------------------------------------------------------------
         progress.update(task, description="Configuration…")
         try:
-            cfg_md, cfg_data = build_config_summary(caps)
+            cfg_md, cfg_data = build_config_summary(caps, client=pg)
             raw_data["config"] = cfg_data
         except Exception as exc:  # noqa: BLE001
             cfg_md = f"> **Error:** {exc}"
@@ -138,7 +145,7 @@ def run_report(
         # ------------------------------------------------------------------
         progress.update(task, description="Inventory…")
         try:
-            inv_md, inv_data = build_inventory(pg)
+            inv_md, inv_data = build_inventory(pg, current_db=caps.current_database)
             raw_data["inventory"] = inv_data
         except Exception as exc:  # noqa: BLE001
             inv_md = f"> **Error:** {exc}"
@@ -146,7 +153,19 @@ def run_report(
         builder.add("Inventory", inv_md)
 
         # ------------------------------------------------------------------
-        # Section 5: Operational health
+        # Section 5: Backup & recovery indicators
+        # ------------------------------------------------------------------
+        progress.update(task, description="Backup & recovery indicators…")
+        try:
+            backup_md, backup_data = build_backup_section(pg, caps)
+            raw_data["backup"] = backup_data
+        except Exception as exc:  # noqa: BLE001
+            backup_md = f"> **Error:** {exc}"
+            raw_data["backup"] = {}
+        builder.add("Backup & Recovery Indicators", backup_md)
+
+        # ------------------------------------------------------------------
+        # Section 6: Operational health
         # ------------------------------------------------------------------
         progress.update(task, description="Operational health…")
         try:

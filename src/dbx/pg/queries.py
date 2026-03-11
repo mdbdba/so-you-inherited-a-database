@@ -13,11 +13,13 @@ Keep ALL SQL here; no inline SQL in other modules.
 # ---------------------------------------------------------------------------
 
 Q_EXTENSIONS = """
--- Lists all extensions installed in the current database.
+-- Lists all extensions installed in the current database along with the
+-- latest version available on this server (from pg_available_extensions).
 -- Permissions: any role that can connect
-SELECT extname, extversion
-FROM pg_extension
-ORDER BY extname;
+SELECT e.extname, e.extversion AS installed_version, a.default_version AS available_version
+FROM pg_extension e
+LEFT JOIN pg_available_extensions a ON a.name = e.extname
+ORDER BY e.extname;
 """
 
 # SHOW <param> statements are issued via PgClient.show(param).
@@ -26,6 +28,20 @@ ORDER BY extname;
 # ---------------------------------------------------------------------------
 # Inventory
 # ---------------------------------------------------------------------------
+
+Q_INSTANCE_DATABASES = """
+-- All non-template databases in this Postgres instance, ordered by size.
+-- pg_database is readable by any role; pg_database_size() requires no
+-- special privileges in modern Postgres.
+SELECT
+    datname                                         AS database_name,
+    pg_size_pretty(pg_database_size(datname))       AS size,
+    pg_encoding_to_char(encoding)                   AS encoding,
+    datcollate                                      AS collation
+FROM pg_database
+WHERE datistemplate = false
+ORDER BY pg_database_size(datname) DESC NULLS LAST;
+"""
 
 Q_DB_SIZE = """
 -- Current database total size on disk.
@@ -243,13 +259,99 @@ SELECT
     round(mean_exec_time::numeric,  2)              AS mean_time_ms,
     round(stddev_exec_time::numeric, 2)             AS stddev_ms,
     rows,
-    round(100.0 * total_exec_time /
-        nullif(sum(total_exec_time) OVER (), 0), 2) AS pct_total,
+    round((100.0 * total_exec_time /
+        nullif(sum(total_exec_time) OVER (), 0))::numeric, 2) AS pct_total,
     left(query, 300)                                AS query_snippet
 FROM pg_stat_statements
 WHERE query NOT LIKE '%pg_stat_statements%'
 ORDER BY total_exec_time DESC
 LIMIT 20;
+"""
+
+# ---------------------------------------------------------------------------
+# Backup & recovery indicators
+# ---------------------------------------------------------------------------
+
+Q_ARCHIVE_STATUS = """
+-- WAL archiver statistics: last archived WAL, timing, and failure counts.
+-- A stale last_archived_time (or high failed_count) is a backup risk signal.
+-- Permissions: pg_monitor or superuser
+SELECT
+    archived_count,
+    last_archived_wal,
+    last_archived_time,
+    failed_count,
+    last_failed_wal,
+    last_failed_time,
+    stats_reset,
+    EXTRACT(EPOCH FROM (now() - last_archived_time))::int   AS seconds_since_last_archive
+FROM pg_stat_archiver;
+"""
+
+Q_REPLICATION_STANDBYS = """
+-- Active streaming replication connections (standbys / read replicas).
+-- Presence of standbys means WAL is flowing and a failover target exists.
+-- Permissions: pg_monitor or superuser
+SELECT
+    application_name,
+    client_addr::text                                               AS client_addr,
+    state,
+    sync_state,
+    sent_lsn::text                                                  AS sent_lsn,
+    replay_lsn::text                                                AS replay_lsn,
+    write_lag,
+    flush_lag,
+    replay_lag,
+    EXTRACT(EPOCH FROM (now() - backend_start))::int                AS connected_seconds
+FROM pg_stat_replication
+ORDER BY application_name;
+"""
+
+Q_REPLICATION_SLOTS = """
+-- Physical and logical replication slots.
+-- Inactive slots can accumulate WAL indefinitely and cause disk pressure.
+-- Permissions: pg_monitor or superuser
+SELECT
+    slot_name,
+    slot_type,
+    database,
+    active,
+    active_pid,
+    restart_lsn::text                                               AS restart_lsn,
+    CASE
+        WHEN restart_lsn IS NOT NULL
+        THEN pg_size_pretty(
+                 pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint
+             )
+        ELSE 'unknown'
+    END                                                             AS retained_wal_size,
+    CASE
+        WHEN restart_lsn IS NOT NULL
+        THEN pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint
+        ELSE NULL
+    END                                                             AS retained_wal_bytes
+FROM pg_replication_slots
+ORDER BY slot_name;
+"""
+
+Q_BACKUP_AGENT_CONNECTIONS = """
+-- Connections from known backup and replication management tools.
+-- An active connection here means a backup or replication agent is working.
+-- Permissions: pg_monitor or superuser
+SELECT
+    pid,
+    application_name,
+    client_addr::text   AS client_addr,
+    state,
+    backend_start
+FROM pg_stat_activity
+WHERE application_name ILIKE ANY(ARRAY[
+    'pg_basebackup', 'barman', 'barman_streaming_backup',
+    'pgbackrest', 'wal-g', 'wal_g',
+    'repmgr', 'patroni', 'stolon',
+    'pg_dump', 'pg_dumpall'
+])
+ORDER BY application_name, backend_start;
 """
 
 # ---------------------------------------------------------------------------
@@ -263,17 +365,149 @@ SELECT 1 FROM cron.job LIMIT 1;
 """
 
 Q_CRON_JOBS = """
--- List pg_cron jobs with schedule and last run status.
+-- Full pg_cron job definitions including command text.
+-- Used for the definitions section (rendered outside a table for full-width display).
 -- Permissions: superuser or cron.job SELECT grant
 SELECT
     jobid,
     schedule,
     command,
-    nodename,
-    nodeport,
     database,
     username,
     active
 FROM cron.job
 ORDER BY jobid;
+"""
+
+Q_CRON_JOB_SUMMARY = """
+-- Per-job operational summary: run counts, failure counts, and average duration
+-- for the last 7 days. Jobs with no run history still appear (via LEFT JOIN).
+-- Permissions: superuser or SELECT on cron.job and cron.job_run_details
+SELECT
+    j.jobid,
+    j.schedule,
+    j.database,
+    j.username,
+    j.active,
+    count(r.runid)
+        FILTER (WHERE r.end_time > now() - interval '7 days')               AS runs_7d,
+    count(r.runid)
+        FILTER (WHERE r.status = 'succeeded'
+                  AND r.end_time > now() - interval '7 days')               AS succeeded_7d,
+    count(r.runid)
+        FILTER (WHERE r.status = 'failed'
+                  AND r.end_time > now() - interval '7 days')               AS failed_7d,
+    round(
+        avg(EXTRACT(EPOCH FROM (r.end_time - r.start_time)))
+        FILTER (WHERE r.status = 'succeeded'
+                  AND r.end_time IS NOT NULL
+                  AND r.end_time > now() - interval '7 days')::numeric, 1)  AS avg_duration_sec,
+    max(r.end_time)                                                          AS last_run
+FROM cron.job j
+LEFT JOIN cron.job_run_details r ON r.jobid = j.jobid
+GROUP BY j.jobid, j.schedule, j.database, j.username, j.active
+ORDER BY j.jobid;
+"""
+
+Q_CRON_RECENT_FAILURES = """
+-- Most recent pg_cron job failures with error messages and duration.
+-- command is taken from the run record (captures the command as it ran).
+-- Permissions: superuser or SELECT on cron.job_run_details
+SELECT
+    r.jobid,
+    r.start_time,
+    round(EXTRACT(EPOCH FROM (r.end_time - r.start_time))::numeric, 1)  AS duration_sec,
+    r.command,
+    r.return_message
+FROM cron.job_run_details r
+WHERE r.status = 'failed'
+ORDER BY r.start_time DESC
+LIMIT 10;
+"""
+
+# ---------------------------------------------------------------------------
+# Memory effectiveness
+# ---------------------------------------------------------------------------
+
+Q_BUFFER_HIT_RATE = """
+-- Buffer cache hit rates for table heap blocks and index blocks.
+-- Computed from cumulative stats since the last pg_stat_reset().
+-- table_hit_pct or index_hit_pct below 95% suggests shared_buffers may be undersized.
+-- Permissions: SELECT on pg_statio_user_tables (public by default)
+SELECT
+    sum(heap_blks_hit)                                                        AS table_hits,
+    sum(heap_blks_read)                                                       AS table_reads,
+    round(
+        sum(heap_blks_hit)::numeric /
+        nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0) * 100, 1
+    )                                                                         AS table_hit_pct,
+    sum(idx_blks_hit)                                                         AS index_hits,
+    sum(idx_blks_read)                                                        AS index_reads,
+    round(
+        sum(idx_blks_hit)::numeric /
+        nullif(sum(idx_blks_hit) + sum(idx_blks_read), 0) * 100, 1
+    )                                                                         AS index_hit_pct
+FROM pg_statio_user_tables;
+"""
+
+Q_TEMP_FILE_STATS = """
+-- Temp file usage for the current database since last stats reset.
+-- temp_files > 0 means some sorts or hash joins spilled to disk.
+-- High temp_bytes suggests work_mem is undersized for some queries.
+-- Permissions: SELECT on pg_stat_database (public by default)
+SELECT
+    temp_files,
+    temp_bytes,
+    pg_size_pretty(temp_bytes)  AS temp_size_pretty,
+    stats_reset
+FROM pg_stat_database
+WHERE datname = current_database();
+"""
+
+# ---------------------------------------------------------------------------
+# Extension health probes
+# ---------------------------------------------------------------------------
+
+Q_PSS_INFO = """
+-- pg_stat_statements eviction counter (PG14+).
+-- dealloc counts how many times entries were evicted to stay under pg_stat_statements.max.
+-- Non-zero dealloc means query history is incomplete.
+-- Permissions: pg_read_all_stats or superuser
+SELECT dealloc, stats_reset FROM pg_stat_statements_info;
+"""
+
+Q_CRON_JOB_STATS = """
+-- pg_cron job run statistics for the last 24 hours.
+-- Counts total runs and failed runs to detect cron job failures.
+-- Permissions: superuser or SELECT on cron.job_run_details
+SELECT
+    count(*)                                              AS total_runs,
+    count(*) FILTER (WHERE status = 'failed')             AS failed_runs
+FROM cron.job_run_details
+WHERE end_time > now() - interval '24 hours';
+"""
+
+Q_POSTGIS_VERSION = """
+-- PostGIS version string, confirming the extension is functional.
+-- Permissions: any role that can connect
+SELECT PostGIS_Version() AS version;
+"""
+
+Q_FOREIGN_SERVER_COUNT = """
+-- Count of foreign servers defined in pg_foreign_server.
+-- Zero servers means postgres_fdw is installed but not yet configured.
+-- Permissions: any role that can connect
+SELECT count(*) AS server_count FROM pg_foreign_server;
+"""
+
+Q_PGVECTOR_PROBE = """
+-- Probe to confirm the vector type is functional.
+-- Permissions: any role that can connect
+SELECT '[1,2,3]'::vector IS NOT NULL AS works;
+"""
+
+Q_DBLINK_FUNCTION_EXISTS = """
+-- Confirm the dblink function exists in pg_proc.
+-- Permissions: any role that can connect
+SELECT count(*) AS fn_count FROM pg_proc WHERE proname = 'dblink';
 """

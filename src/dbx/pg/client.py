@@ -12,6 +12,19 @@ import psycopg
 from psycopg.rows import dict_row
 
 
+def dsn_for_database(dsn: str, dbname: str) -> str:
+    """Return *dsn* with the database component replaced by *dbname*.
+
+    Works with standard ``postgresql://user:pass@host:port/dbname`` URIs.
+    Query-string parameters (e.g. ``?sslmode=disable``) are preserved.
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(dsn)
+    new = parsed._replace(path=f"/{dbname}")
+    return urlunparse(new)
+
+
 class PgClient:
     """Synchronous Postgres client. Use as a context manager."""
 

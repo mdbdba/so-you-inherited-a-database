@@ -31,6 +31,11 @@ SHOW_SETTINGS: list[str] = [
     "pg_stat_statements.max",
     "pg_stat_statements.track",
     "cron.database_name",
+    # Backup / archiving
+    "archive_mode",
+    "wal_level",
+    "archive_command",
+    "archive_library",   # PG15+ alternative to archive_command
 ]
 
 
@@ -45,7 +50,8 @@ class PgCapabilities:
 
     settings: dict[str, str] = field(default_factory=dict)
     settings_errors: dict[str, str] = field(default_factory=dict)
-    extensions: dict[str, str] = field(default_factory=dict)  # name → version
+    extensions: dict[str, str] = field(default_factory=dict)           # name → installed version
+    extensions_available: dict[str, str] = field(default_factory=dict)  # name → latest available version
 
     # pg_stat_statements
     pss_in_shared_preload: bool = False
@@ -64,8 +70,14 @@ class PgCapabilities:
     pg_cron_extension_installed: bool = False
     pg_cron_job_readable: bool = False
     pg_cron_job_error: str = ""
-    pg_cron_database_name: str = ""
+    pg_cron_database_name: str = ""  # value of cron.database_name setting
     pg_cron_ready: bool = False
+    # True when pg_cron is loaded and its scheduler database differs from the
+    # current connection database — the canonical "cron lives in postgres,
+    # jobs run against bluebox" pattern.
+    pg_cron_runs_elsewhere: bool = False
+
+    current_database: str = ""  # result of SELECT current_database()
 
 
 # ---------------------------------------------------------------------------
@@ -103,9 +115,11 @@ def detect_capabilities(client: PgClient) -> PgCapabilities:
     # 4. Installed extensions.
     try:
         rows = client.fetchall(Q_EXTENSIONS)
-        caps.extensions = {r["extname"]: r["extversion"] for r in rows}
+        caps.extensions = {r["extname"]: r["installed_version"] for r in rows}
+        caps.extensions_available = {r["extname"]: r["available_version"] or "" for r in rows}
     except Exception as exc:  # noqa: BLE001
         caps.extensions = {}
+        caps.extensions_available = {}
         caps.settings_errors["extensions"] = str(exc)
 
     caps.pss_extension_installed = "pg_stat_statements" in caps.extensions
@@ -122,7 +136,14 @@ def detect_capabilities(client: PgClient) -> PgCapabilities:
         and caps.pss_view_readable
     )
 
-    # 6. pg_cron job table probe.
+    # 6. Current database name (needed to detect cross-database cron setup).
+    try:
+        row = client.fetchone("SELECT current_database() AS db")
+        caps.current_database = row["db"] if row else ""
+    except Exception:  # noqa: BLE001
+        caps.current_database = ""
+
+    # 7. pg_cron job table probe.
     if caps.pg_cron_extension_installed:
         ok, err = client.probe(Q_CRON_PROBE)
         caps.pg_cron_job_readable = ok
@@ -131,6 +152,17 @@ def detect_capabilities(client: PgClient) -> PgCapabilities:
         caps.pg_cron_in_shared_preload
         and caps.pg_cron_extension_installed
         and caps.pg_cron_job_readable
+    )
+
+    # 8. Detect the common pattern where pg_cron is loaded server-wide but its
+    #    scheduler database (cron.database_name) differs from the current DB.
+    #    In this case the extension is intentionally absent here — the jobs are
+    #    visible from the cron database, not this one.
+    caps.pg_cron_runs_elsewhere = (
+        caps.pg_cron_in_shared_preload
+        and not caps.pg_cron_extension_installed
+        and bool(caps.pg_cron_database_name)
+        and caps.pg_cron_database_name != caps.current_database
     )
 
     return caps

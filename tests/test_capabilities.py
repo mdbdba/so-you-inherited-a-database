@@ -70,6 +70,74 @@ class TestPgCapabilities:
         assert caps.pss_ready is False
         assert "permission denied" in caps.pss_view_error
 
+    # --- pg_cron runs_elsewhere ---
+
+    def test_pg_cron_runs_elsewhere_when_cron_db_differs(self):
+        """Standard bluebox setup: pg_cron loaded server-wide, scheduler in 'postgres',
+        but we are connected to 'bluebox'."""
+        caps = self._make_caps(
+            pg_cron_in_shared_preload=True,
+            pg_cron_extension_installed=False,
+            pg_cron_database_name="postgres",
+            current_database="bluebox",
+        )
+        caps.pg_cron_runs_elsewhere = (
+            caps.pg_cron_in_shared_preload
+            and not caps.pg_cron_extension_installed
+            and bool(caps.pg_cron_database_name)
+            and caps.pg_cron_database_name != caps.current_database
+        )
+        assert caps.pg_cron_runs_elsewhere is True
+        assert caps.pg_cron_ready is False
+
+    def test_pg_cron_not_runs_elsewhere_when_same_db(self):
+        """If cron.database_name matches current DB, it's just not installed yet."""
+        caps = self._make_caps(
+            pg_cron_in_shared_preload=True,
+            pg_cron_extension_installed=False,
+            pg_cron_database_name="postgres",
+            current_database="postgres",
+        )
+        caps.pg_cron_runs_elsewhere = (
+            caps.pg_cron_in_shared_preload
+            and not caps.pg_cron_extension_installed
+            and bool(caps.pg_cron_database_name)
+            and caps.pg_cron_database_name != caps.current_database
+        )
+        assert caps.pg_cron_runs_elsewhere is False
+
+    def test_pg_cron_not_runs_elsewhere_when_no_cron_db_name(self):
+        """No cron.database_name setting means we can't determine the cron database."""
+        caps = self._make_caps(
+            pg_cron_in_shared_preload=True,
+            pg_cron_extension_installed=False,
+            pg_cron_database_name="",
+            current_database="bluebox",
+        )
+        caps.pg_cron_runs_elsewhere = (
+            caps.pg_cron_in_shared_preload
+            and not caps.pg_cron_extension_installed
+            and bool(caps.pg_cron_database_name)
+            and caps.pg_cron_database_name != caps.current_database
+        )
+        assert caps.pg_cron_runs_elsewhere is False
+
+    def test_pg_cron_not_runs_elsewhere_when_not_in_preload(self):
+        """pg_cron not in shared_preload_libraries — it simply isn't configured."""
+        caps = self._make_caps(
+            pg_cron_in_shared_preload=False,
+            pg_cron_extension_installed=False,
+            pg_cron_database_name="postgres",
+            current_database="bluebox",
+        )
+        caps.pg_cron_runs_elsewhere = (
+            caps.pg_cron_in_shared_preload
+            and not caps.pg_cron_extension_installed
+            and bool(caps.pg_cron_database_name)
+            and caps.pg_cron_database_name != caps.current_database
+        )
+        assert caps.pg_cron_runs_elsewhere is False
+
     # --- pg_cron readiness ---
 
     def test_pg_cron_ready_when_all_conditions_met(self):
