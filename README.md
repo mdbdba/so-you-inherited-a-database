@@ -4,7 +4,7 @@
 
 A demo environment and inspection toolkit for Postgres databases you've just inherited.
 
-Bluebox drives external workload against Postgres. This repo provides `dbx` — a CLI that
+Bluebox drives an external workload against Postgres. This repo provides `dbx` — a CLI that
 generates a Markdown report correlating Postgres internals with Grafana (Prometheus + Loki).
 
 ---
@@ -94,15 +94,17 @@ Options:
 ### Report sections
 
 1. **Report Details** – timestamp, redacted DSN, report range, Postgres version
-2. **Capabilities** – installed extensions table, readiness for pg_stat_statements / auto_explain / pg_cron
-3. **Configuration Summary** – key settings with notes (`shared_buffers`, `work_mem`, etc.)
-4. **Inventory** – DB size, top 10 tables/indexes by size, schema/table counts
-5. **Operational Health** – connection usage, long-running transactions, blocked queries
-6. **Vacuum & Bloat** – tables ranked by dead tuple ratio with last vacuum/analyze times
-7. **Index Health** – unused indexes, high sequential-scan tables
-8. **Query Performance** – top 20 queries by total time from pg_stat_statements (when ready)
-9. **Telemetry Correlation** – Prometheus metric summary table + Loki log excerpts
-10. **Findings & Next Actions** – top 5 risks and top 5 easy wins from the rules engine
+2. **Capabilities** – installed extensions with versions and update availability; preload status and readiness for `pg_stat_statements` / `auto_explain` / `pg_cron`; extension health table classifying each extension as Healthy, Warning, Degraded, Passive, or Unknown
+3. **pg_cron Jobs** *(when pg_cron is active)* – 7-day run metrics (runs, failures, avg duration) per job; full SQL job definitions; recent failure details
+4. **Configuration Summary** – key settings with context notes; Memory Effectiveness subsection with live buffer cache hit rates (table and index) and temp-file spill data since last stats reset
+5. **Inventory** – DB size, schema/table counts; top 10 tables with row counts, index overhead, dead tuple ratio, and vacuum age; top 10 indexes with scan counts and callouts for unused large indexes
+6. **Backup & Recovery Indicators** – WAL archiving configuration and `pg_stat_archiver` status; active streaming standbys; replication slots with retained WAL size; active backup agent connections
+7. **Operational Health** – connection usage with idle-in-transaction duration, available headroom, and wait events breakdown; long-running transactions; blocked queries with blocker/waiter chains
+8. **Vacuum & Bloat** – tables ranked by dead tuple ratio with last vacuum/analyze timestamps
+9. **Index Health** – unused indexes (`idx_scan < 10`), high sequential-scan tables
+10. **Query Performance** – top 15 queries by total execution time from `pg_stat_statements`; callouts for slow individual queries (mean > 1 s), high-variability plans (stddev > 2× mean), and queries spilling to temp files
+11. **Telemetry Correlation** – Prometheus metric summary table and Loki log excerpts from Grafana
+12. **Findings & Next Actions** – rules engine surfacing up to 5 risks and 5 easy wins from data collected across all sections
 
 ---
 
@@ -119,23 +121,30 @@ uv run pytest -v
 ```
 src/
   cmd/
-    report.py           # report orchestration (entry-point for `dbx report`)
+    report.py             # report orchestration (entry-point for `dbx report`)
   dbx/
-    cli.py              # Typer app, registers commands
-    config.py           # pydantic settings (env vars)
+    cli.py                # Typer app, registers commands
+    config.py             # pydantic settings (env vars)
     pg/
-      client.py         # psycopg v3 connection wrapper
-      queries.py        # all SQL constants (documented)
-      inspect.py        # capability detection
-      sections.py       # per-section data + Markdown generators
+      client.py           # psycopg v3 connection wrapper
+      queries.py          # all SQL constants (documented)
+      inspect.py          # capability detection
+      extension_health.py # per-extension health probes (Active / Passive / Unknown)
+      sections.py         # per-section data + Markdown generators
     grafana/
-      client.py         # Grafana REST API wrapper
-      sections.py       # PromQL / LogQL queries + Markdown rendering
+      client.py           # Grafana REST API wrapper
+      sections.py         # PromQL / LogQL queries + Markdown rendering
     report/
-      markdown.py       # ReportBuilder + formatting utilities
-      findings.py       # rules engine
+      markdown.py         # ReportBuilder + formatting utilities
+      findings.py         # rules engine (risks + easy wins)
 tests/
-  test_config.py        # env-var parsing
-  test_markdown.py      # table + report assembly
-  test_capabilities.py  # capability detection + findings logic
+  conftest.py                   # shared fixtures
+  test_config.py                # env-var parsing
+  test_markdown.py              # table + report assembly
+  test_capabilities.py          # capability detection + findings logic
+  test_backup_section.py        # backup section rendering + findings
+  test_extension_health.py      # extension health probes + classification
+  test_memory_effectiveness.py  # buffer hit rate + temp spill rendering
+  test_pg_client.py             # PgClient wrapper
+  test_queries.py               # SQL constant structure validation
 ```

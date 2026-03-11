@@ -51,19 +51,28 @@ SELECT pg_size_pretty(pg_database_size(current_database())) AS db_size_pretty,
 """
 
 Q_TOP_TABLES_BY_SIZE = """
--- Top 10 largest tables (by total size including indexes and TOAST).
--- Permissions: SELECT on pg_catalog tables (public by default)
+-- Top 10 largest tables with actionable context: row count, index overhead,
+-- dead tuple ratio, and time since last vacuum.
+-- Permissions: SELECT on pg_catalog and pg_stat_user_tables (public by default)
 SELECT
-    n.nspname                                            AS schema,
-    c.relname                                            AS table_name,
-    pg_size_pretty(pg_total_relation_size(c.oid))        AS total_size,
-    pg_size_pretty(pg_relation_size(c.oid))              AS table_size,
-    pg_size_pretty(
-        pg_total_relation_size(c.oid) - pg_relation_size(c.oid)
-    )                                                    AS index_size,
-    pg_total_relation_size(c.oid)                        AS total_bytes
+    n.nspname                                                               AS schema,
+    c.relname                                                               AS table_name,
+    pg_size_pretty(pg_total_relation_size(c.oid))                           AS total_size,
+    coalesce(s.n_live_tup, 0)                                               AS rows,
+    round(
+        (pg_total_relation_size(c.oid) - pg_relation_size(c.oid))::numeric /
+        nullif(pg_total_relation_size(c.oid), 0) * 100, 0
+    )                                                                       AS index_pct,
+    CASE
+        WHEN coalesce(s.n_live_tup, 0) > 0
+        THEN round(s.n_dead_tup::numeric / s.n_live_tup * 100, 1)
+        ELSE NULL
+    END                                                                     AS dead_pct,
+    greatest(s.last_vacuum, s.last_autovacuum)                              AS last_vacuumed,
+    pg_total_relation_size(c.oid)                                           AS total_bytes
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
 WHERE c.relkind = 'r'
   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
 ORDER BY total_bytes DESC
@@ -71,20 +80,25 @@ LIMIT 10;
 """
 
 Q_TOP_INDEXES_BY_SIZE = """
--- Top 10 largest indexes.
--- Permissions: SELECT on pg_catalog tables (public by default)
+-- Top 10 largest indexes with scan counts and constraint type flags.
+-- idx_scan = 0 on a non-constraint index is a strong drop candidate.
+-- Permissions: SELECT on pg_catalog and pg_stat_user_indexes (public by default)
 SELECT
-    n.nspname                                   AS schema,
-    t.relname                                   AS table_name,
-    i.relname                                   AS index_name,
-    am.amname                                   AS index_type,
-    pg_size_pretty(pg_relation_size(i.oid))     AS index_size,
-    pg_relation_size(i.oid)                     AS index_bytes
+    n.nspname                                       AS schema,
+    t.relname                                       AS table_name,
+    i.relname                                       AS index_name,
+    am.amname                                       AS index_type,
+    pg_size_pretty(pg_relation_size(i.oid))         AS index_size,
+    coalesce(us.idx_scan, 0)                        AS idx_scan,
+    ix.indisprimary                                 AS is_primary,
+    ix.indisunique                                  AS is_unique,
+    pg_relation_size(i.oid)                         AS index_bytes
 FROM pg_index ix
 JOIN pg_class i   ON i.oid  = ix.indexrelid
 JOIN pg_class t   ON t.oid  = ix.indrelid
 JOIN pg_namespace n ON n.oid = t.relnamespace
 JOIN pg_am am     ON am.oid  = i.relam
+LEFT JOIN pg_stat_user_indexes us ON us.indexrelid = i.oid
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
 ORDER BY index_bytes DESC
 LIMIT 10;
@@ -106,18 +120,38 @@ WHERE table_type = 'BASE TABLE'
 # ---------------------------------------------------------------------------
 
 Q_CONNECTION_STATS = """
--- Current connection usage vs max_connections setting.
+-- Current connection usage vs max_connections and superuser_reserved_connections.
+-- max_idle_in_txn_secs is the age of the oldest idle-in-transaction session.
 -- Permissions: pg_monitor (or superuser) for full detail;
 --              any role for their own connections.
 SELECT
-    count(*)                                                      AS total_connections,
-    count(*) FILTER (WHERE state = 'active')                      AS active,
-    count(*) FILTER (WHERE state = 'idle')                        AS idle,
-    count(*) FILTER (WHERE state = 'idle in transaction')         AS idle_in_txn,
-    count(*) FILTER (WHERE wait_event_type IS NOT NULL)           AS waiting,
-    current_setting('max_connections')::int                       AS max_connections
+    count(*)                                                            AS total_connections,
+    count(*) FILTER (WHERE state = 'active')                           AS active,
+    count(*) FILTER (WHERE state = 'idle')                             AS idle,
+    count(*) FILTER (WHERE state = 'idle in transaction')              AS idle_in_txn,
+    count(*) FILTER (WHERE wait_event_type IS NOT NULL)                AS waiting,
+    current_setting('max_connections')::int                            AS max_connections,
+    current_setting('superuser_reserved_connections')::int             AS superuser_reserved,
+    max(EXTRACT(EPOCH FROM (now() - state_change))::int)
+        FILTER (WHERE state = 'idle in transaction')                   AS max_idle_in_txn_secs
 FROM pg_stat_activity
 WHERE pid <> pg_backend_pid();
+"""
+
+Q_WAIT_EVENTS = """
+-- Breakdown of what waiting backends are blocked on.
+-- Only backends with a non-null wait_event_type are included.
+-- Lock waits indicate contention; see pg_stat_activity / blocked queries for detail.
+-- Permissions: pg_monitor (or superuser) for all backends.
+SELECT
+    wait_event_type,
+    coalesce(wait_event, '—')   AS wait_event,
+    count(*)                    AS connections
+FROM pg_stat_activity
+WHERE pid <> pg_backend_pid()
+  AND wait_event_type IS NOT NULL
+GROUP BY wait_event_type, wait_event
+ORDER BY connections DESC, wait_event_type, wait_event;
 """
 
 Q_LONG_RUNNING_TRANSACTIONS = """
@@ -249,23 +283,25 @@ SELECT 1 FROM pg_stat_statements LIMIT 1;
 """
 
 Q_PSS_TOP_QUERIES = """
--- Top 20 queries by total execution time from pg_stat_statements.
--- Includes call count, mean time, rows returned, and truncated query text.
+-- Top 15 queries by total execution time from pg_stat_statements.
+-- variability = stddev / mean (coefficient of variation); > 2 suggests plan instability.
+-- temp_blks_written counts 8 kB blocks spilled to disk during sorts or hash joins.
 -- Permissions: pg_read_all_stats or superuser
 SELECT
     queryid,
     calls,
-    round(total_exec_time::numeric, 2)              AS total_time_ms,
-    round(mean_exec_time::numeric,  2)              AS mean_time_ms,
-    round(stddev_exec_time::numeric, 2)             AS stddev_ms,
-    rows,
+    round(total_exec_time::numeric, 2)                                  AS total_time_ms,
+    round(mean_exec_time::numeric,  2)                                  AS mean_time_ms,
+    round(rows::numeric / nullif(calls, 0), 1)                         AS rows_per_call,
+    round(stddev_exec_time::numeric / nullif(mean_exec_time::numeric, 0), 2)  AS variability,
+    coalesce(temp_blks_written, 0)                                      AS temp_blks_written,
     round((100.0 * total_exec_time /
-        nullif(sum(total_exec_time) OVER (), 0))::numeric, 2) AS pct_total,
-    left(query, 300)                                AS query_snippet
+        nullif(sum(total_exec_time) OVER (), 0))::numeric, 2)          AS pct_total,
+    left(query, 300)                                                    AS query_snippet
 FROM pg_stat_statements
 WHERE query NOT LIKE '%pg_stat_statements%'
 ORDER BY total_exec_time DESC
-LIMIT 20;
+LIMIT 15;
 """
 
 # ---------------------------------------------------------------------------

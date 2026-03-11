@@ -33,13 +33,34 @@ from dbx.pg.queries import (
     Q_TOP_TABLES_BY_SIZE,
     Q_UNUSED_INDEXES,
     Q_VACUUM_BLOAT,
+    Q_WAIT_EVENTS,
 )
 from dbx.report.markdown import err_block, md_table
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helpers
 # ---------------------------------------------------------------------------
+
+
+def _age_str(ts: object) -> str:
+    """Return a compact human-readable age for a timestamp ('3d ago', '2h ago').
+
+    Returns '—' for None. Falls back to str(ts) on any error.
+    """
+    if ts is None:
+        return "—"
+    try:
+        secs = (datetime.now(tz=timezone.utc) - ts).total_seconds()  # type: ignore[operator]
+        if secs < 3600:
+            return f"{int(secs / 60)}m ago"
+        if secs < 86400:
+            return f"{int(secs / 3600)}h ago"
+        if secs < 86400 * 60:
+            return f"{int(secs / 86400)}d ago"
+        return f"{int(secs / 86400 / 30)}mo ago"
+    except Exception:  # noqa: BLE001
+        return str(ts)
 
 
 def _safe(client: PgClient, fn: Any) -> tuple[list[dict], str | None]:
@@ -309,14 +330,7 @@ def _build_memory_effectiveness(client: PgClient) -> tuple[str, dict]:
     reset_str = ""
     if stats_reset is not None:
         try:
-            age_secs = (datetime.now(tz=timezone.utc) - stats_reset).total_seconds()
-            if age_secs < 3600:
-                age_str = f"{int(age_secs / 60)}m ago"
-            elif age_secs < 86400:
-                age_str = f"{int(age_secs / 3600)}h ago"
-            else:
-                age_str = f"{int(age_secs / 86400)}d ago"
-            reset_str = f"{stats_reset.strftime('%Y-%m-%d %H:%M UTC')} ({age_str})"
+            reset_str = f"{stats_reset.strftime('%Y-%m-%d %H:%M UTC')} ({_age_str(stats_reset)})"
         except Exception:  # noqa: BLE001
             reset_str = str(stats_reset)
 
@@ -423,8 +437,44 @@ def build_inventory(client: PgClient, current_db: str = "") -> tuple[str, dict]:
         raw["top_tables"] = rows
         if rows:
             lines.append("### Top 10 Largest Tables\n")
-            cols = ["schema", "table_name", "total_size", "table_size", "index_size"]
-            lines.append(md_table(rows, cols))
+            display: list[dict] = []
+            never_vacuumed: list[str] = []
+            heavily_indexed: list[tuple[str, str]] = []
+            for r in rows:
+                n_rows = r.get("rows") or 0
+                idx_pct = r.get("index_pct")
+                dead_pct = r.get("dead_pct")
+                last_vac = r.get("last_vacuumed")
+                vac_str = _age_str(last_vac) if last_vac is not None else "Never"
+                display.append({
+                    "Schema": r["schema"],
+                    "Table": r["table_name"],
+                    "Total size": r["total_size"],
+                    "Rows": f"{n_rows:,}",
+                    "Index %": f"{int(idx_pct)}%" if idx_pct is not None else "—",
+                    "Bloat": f"{dead_pct}%" if dead_pct is not None else "—",
+                    "Last vacuum": vac_str,
+                })
+                if last_vac is None:
+                    never_vacuumed.append(r["table_name"])
+                if idx_pct is not None and float(idx_pct) > 70:
+                    heavily_indexed.append((r["table_name"], f"{int(idx_pct)}%"))
+            lines.append(md_table(
+                display,
+                ["Schema", "Table", "Total size", "Rows", "Index %", "Bloat", "Last vacuum"],
+            ))
+            if never_vacuumed:
+                names = ", ".join(f"`{n}`" for n in never_vacuumed)
+                lines.append(
+                    f"\n> **Never vacuumed:** {names}  \n"
+                    "> Run `VACUUM ANALYZE` and verify autovacuum is enabled on these tables."
+                )
+            if heavily_indexed:
+                items = ", ".join(f"`{n}` ({p})" for n, p in heavily_indexed)
+                lines.append(
+                    f"\n> **High index overhead (>70%):** {items}  \n"
+                    "> Review for unused or redundant indexes — see Index Health section below."
+                )
         else:
             lines.append("*No user tables found.*")
     except Exception as exc:  # noqa: BLE001
@@ -436,8 +486,29 @@ def build_inventory(client: PgClient, current_db: str = "") -> tuple[str, dict]:
         raw["top_indexes"] = rows
         if rows:
             lines.append("\n### Top 10 Largest Indexes\n")
-            cols = ["schema", "table_name", "index_name", "index_type", "index_size"]
-            lines.append(md_table(rows, cols))
+            display = []
+            unused_large: list[tuple[str, str]] = []
+            for r in rows:
+                idx_scan = r.get("idx_scan", 0) or 0
+                is_constraint = r.get("is_primary") or r.get("is_unique")
+                display.append({
+                    "Schema": r["schema"],
+                    "Table": r["table_name"],
+                    "Index": r["index_name"],
+                    "Type": r["index_type"],
+                    "Size": r["index_size"],
+                    "Scans": f"{idx_scan:,}",
+                })
+                if idx_scan == 0 and not is_constraint:
+                    unused_large.append((r["index_name"], r["index_size"]))
+            lines.append(md_table(display, ["Schema", "Table", "Index", "Type", "Size", "Scans"]))
+            if unused_large:
+                names = ", ".join(f"`{n}` ({s})" for n, s in unused_large)
+                lines.append(
+                    f"\n> **Unused indexes in top 10 by size:** {names}  \n"
+                    "> 0 scans since last stats reset — review before dropping "
+                    "(also listed in the Index Health section)."
+                )
     except Exception as exc:  # noqa: BLE001
         lines.append(err_block("Top indexes unavailable", str(exc)))
 
@@ -457,18 +528,57 @@ def build_operational_health(client: PgClient) -> tuple[str, dict]:
     try:
         row = client.fetchone(Q_CONNECTION_STATS)
         if row:
-            pct = round(row["total_connections"] / row["max_connections"] * 100, 1)
+            total = row["total_connections"]
+            max_conn = row["max_connections"]
+            superuser_reserved = row.get("superuser_reserved") or 3
+            pct = round(total / max_conn * 100, 1)
+            available = max_conn - total - superuser_reserved
+
+            # Idle-in-transaction: append longest-waiting duration when present
+            idle_in_txn = row["idle_in_txn"]
+            max_idle = row.get("max_idle_in_txn_secs")
+            idle_str = str(idle_in_txn)
+            if idle_in_txn and max_idle is not None:
+                idle_str = f"{idle_in_txn} (longest: {_fmt_duration(max_idle)})"
+
+            conn_rows = [
+                {"Metric": "Total",               "Value": f"{total} / {max_conn} ({pct}%)"},
+                {"Metric": "Active",               "Value": str(row["active"])},
+                {"Metric": "Idle",                 "Value": str(row["idle"])},
+                {"Metric": "Idle in transaction",  "Value": idle_str},
+                {"Metric": "Waiting",              "Value": str(row["waiting"])},
+                {"Metric": "Available",            "Value": f"{available} (excl. {superuser_reserved} superuser reserved)"},
+            ]
             lines.append("### Connection Usage\n")
-            lines.append(
-                f"| Metric | Value |\n|--------|-------|\n"
-                f"| Total connections | {row['total_connections']} / {row['max_connections']} ({pct}%) |\n"
-                f"| Active | {row['active']} |\n"
-                f"| Idle | {row['idle']} |\n"
-                f"| Idle in transaction | {row['idle_in_txn']} |\n"
-                f"| Waiting | {row['waiting']} |"
-            )
+            lines.append(md_table(conn_rows, ["Metric", "Value"]))
+
+            if available < 10:
+                lines.append(
+                    f"\n> **Low connection headroom** — only {available} connection(s) remain "
+                    f"before `max_connections` ({max_conn}) is reached (excluding {superuser_reserved} "
+                    "superuser reserved slots). Consider connection pooling (PgBouncer)."
+                )
+
             raw["connections"] = dict(row)
             raw["connection_pct"] = pct
+
+            # Wait events breakdown — only when something is waiting
+            if row["waiting"] > 0:
+                try:
+                    wait_rows = client.fetchall(Q_WAIT_EVENTS)
+                    if wait_rows:
+                        lines.append("\n### Wait Events\n")
+                        lines.append(md_table(wait_rows, ["wait_event_type", "wait_event", "connections"]))
+                        has_lock = any(r.get("wait_event_type") == "Lock" for r in wait_rows)
+                        if has_lock:
+                            lines.append(
+                                "\n> **Lock waits detected** — see the Blocked Queries section "
+                                "below for blocker/waiter chains."
+                            )
+                        raw["wait_events"] = wait_rows
+                except Exception:  # noqa: BLE001
+                    pass
+
     except Exception as exc:  # noqa: BLE001
         lines.append(err_block("Connection stats unavailable", str(exc)))
 
@@ -595,11 +705,73 @@ def build_query_performance(client: PgClient, caps: PgCapabilities) -> tuple[str
         rows = client.fetchall(Q_PSS_TOP_QUERIES)
         if not rows:
             return "*No statements recorded yet.*", {}
-        cols = [
-            "queryid", "calls", "total_time_ms", "mean_time_ms",
-            "stddev_ms", "rows", "pct_total", "query_snippet",
+
+        def _snip(text: str | None, n: int = 60) -> str:
+            # Collapse all whitespace (newlines, indentation, multiple spaces) then truncate
+            s = " ".join((text or "").split())
+            return s[:n] + ("…" if len(s) > n else "")
+
+        # Main display table — drop queryid; format total_time humanly
+        display = []
+        for r in rows:
+            total_ms = float(r.get("total_time_ms") or 0)
+            rows_per = r.get("rows_per_call")
+            display.append({
+                "% DB time":  f"{r['pct_total']}%",
+                "Calls":      f"{r['calls']:,}",
+                "Total time": _fmt_duration(total_ms / 1000),
+                "Mean (ms)":  str(r["mean_time_ms"]),
+                "Rows/call":  str(rows_per) if rows_per is not None else "—",
+                "Query":      _snip(r.get("query_snippet"), 150),
+            })
+
+        lines = [md_table(display, ["% DB time", "Calls", "Total time", "Mean (ms)", "Rows/call", "Query"])]
+
+        # Callout 1: slow individual queries (mean > 1 s) — one bullet per query
+        slow = [r for r in rows if (r.get("mean_time_ms") or 0) > 1000]
+        if slow:
+            block = [f"\n> **{len(slow)} slow query(ies) with mean execution time > 1 s** — run `EXPLAIN (ANALYZE, BUFFERS)` on each:\n>"]
+            for r in slow:
+                block.append(
+                    f"> - `{_snip(r.get('query_snippet'))}` — "
+                    f"mean **{_fmt_duration(float(r['mean_time_ms']) / 1000)}**, {r['calls']:,} call(s)"
+                )
+            lines.append("\n".join(block))
+
+        # Callout 2: high variability (CV > 2.0, at least 10 calls for statistical signal)
+        volatile = [
+            r for r in rows
+            if (r.get("variability") or 0) > 2.0 and (r.get("calls") or 0) >= 10
         ]
-        return md_table(rows, cols), {"top_queries": rows}
+        if volatile:
+            block = [f"\n> **{len(volatile)} high-variability query(ies)** (stddev > 2× mean, ≥ 10 calls) — inconsistent plans suggest missing indexes, table bloat, or parameter sniffing:\n>"]
+            for r in volatile:
+                block.append(
+                    f"> - `{_snip(r.get('query_snippet'))}` — CV: **{r['variability']}**"
+                )
+            lines.append("\n".join(block))
+
+        # Callout 3: queries spilling to temp files — one bullet per query (top 3)
+        spilling = sorted(
+            [r for r in rows if (r.get("temp_blks_written") or 0) > 0],
+            key=lambda r: r.get("temp_blks_written") or 0,
+            reverse=True,
+        )
+        if spilling:
+            total_mb = sum(r.get("temp_blks_written") or 0 for r in spilling) * 8192 / 1024 / 1024
+            block = [
+                f"\n> **{len(spilling)} query(ies) in this list spill to temp files** "
+                f"(~{total_mb:.0f} MB cumulative) — increasing `work_mem` may help, "
+                "but apply carefully as it multiplies across concurrent operations:\n>"
+            ]
+            for r in spilling[:3]:
+                spill_mb = int(r["temp_blks_written"] * 8192 / 1024 / 1024)
+                block.append(
+                    f"> - `{_snip(r.get('query_snippet'))}` — **{spill_mb} MB** spilled"
+                )
+            lines.append("\n".join(block))
+
+        return "\n".join(lines), {"top_queries": rows}
     except Exception as exc:  # noqa: BLE001
         return err_block("pg_stat_statements query failed", str(exc)), {}
 
